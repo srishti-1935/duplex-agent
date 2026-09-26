@@ -12,6 +12,8 @@ from schemas import Event, EventType, Action, ActionType, StateSnapshot
 from orchestrator.task_manager import TaskManager
 from orchestrator.cancellation import handle_cancel_decision, is_result_stale
 from orchestrator.ledger import already_dispatched, record_dispatch
+from multimodal.speech import wav_to_text_event
+from multimodal.vision import png_to_text_event
 
 
 class Orchestrator:
@@ -20,7 +22,15 @@ class Orchestrator:
         self.state = StateSnapshot(revision=0, intent=None, slots={})
 
     async def handle_event(self, event: Event, output_queue: asyncio.Queue):
-        if event.type in (EventType.TEXT_CHUNK, EventType.AUDIO_WAV, EventType.VIDEO_FRAME):
+        if event.type == EventType.AUDIO_WAV:
+            event = wav_to_text_event(event)
+            await self._handle_input_turn(event, output_queue)
+
+        elif event.type == EventType.VIDEO_FRAME:
+            event = png_to_text_event(event)
+            await self._handle_input_turn(event, output_queue)
+
+        elif event.type == EventType.TEXT_CHUNK:
             await self._handle_input_turn(event, output_queue)
 
         elif event.type == EventType.INTERRUPTION:
@@ -107,7 +117,6 @@ class Orchestrator:
             ))
 
     async def _handle_tool_result(self, event: Event, output_queue: asyncio.Queue):
-        incoming_revision = self.task_manager.get_revision(event.call_id)
         if is_result_stale(event.call_id, self.state.revision, self.task_manager):
             return  # discard silently
 
