@@ -58,19 +58,63 @@ Carried over from the original design, now living inside the LiveKit agent's rea
 
 ## Repo structure
 
-`TODO` — fill in once P1's LiveKit agent skeleton lands.
+`TODO` — fill in once P1's LiveKit agent skeleton lands. For reference, the FDB-v3 harness itself (which our agent plugs into) is laid out like this — our own code most likely lives as a modified `cascaded_agent.py` plus whatever new modules P1/P2 add for the classifier/ledger/state logic:
+
+```
+v3/
+├── cascaded_agent.py                    # <- our starting point: Silero VAD + Whisper STT + gpt-4o + OpenAI TTS
+├── lk_agent_tool.py                     # native realtime agent (GPT Realtime/Gemini/Grok/Ultravox) — not our path
+├── mock_apis.py                         # the 12 mock tool backends
+├── benchmark_data_v2.json               # 79 scenario definitions
+├── run_tool_benchmark_all_released.py   # batch inference — streams all 100 recordings through our agent
+├── evaluate_tool_calls.py               # F1 / argument accuracy / response quality
+├── evaluate_pass_rate.py                # strict binary pass/fail
+├── analyze_tool_latency.py              # latency breakdown
+└── fdb_v3_data_released/                # benchmark audio + metadata (downloaded separately, not in git)
+```
 
 ## Setup & run
 
-`TODO` — one-command reproduction script goes here once P3 builds it. Must be tested on a machine that isn't the dev machine (P4's job) before submission — 60% of the score is a re-run of this by the organizers.
+Confirmed from the actual FDB-v3 `v3/README.md`:
 
+```bash
+# 1. Environment
+conda create -n fdb python=3.10 && conda activate fdb
+pip install "livekit-agents[openai,google,xai]~=1.3" "livekit-plugins-ultravox" python-dotenv
+pip install "livekit-plugins-silero" "livekit-plugins-openai"   # cascaded agent deps
+pip install "livekit[crypto]~=1.0" numpy
+pip install nemo_toolkit[asr]        # ASR model used to transcribe the agent's spoken response for eval
+pip install pydub ffmpeg-python openai
+# external: ffmpeg (apt install ffmpeg / brew install ffmpeg)
+
+# 2. .env.local in v3/
+# LIVEKIT_URL / LIVEKIT_API_KEY / LIVEKIT_API_SECRET   (free LiveKit Cloud account)
+# OPENAI_API_KEY                                        (cascaded agent + gpt-4o judge)
+
+# 3. Benchmark data — NOT in git, download manually:
+# https://drive.google.com/file/d/1SO_4MTazWQ_jvCx0dtmpQ-t40bdd07yz/view
+# extract fdb_v3_data_released/ into v3/
+
+# 4. Run — three terminals worth of steps, in order:
+cd v3
+python cascaded_agent.py start                                    # Terminal 1: our agent, stays running
+python run_tool_benchmark_all_released.py --provider cascaded      # Terminal 2: batch inference, all 100 recordings
+bash run_all_evaluations_released.sh                                # Terminal 2, after inference finishes: scoring
 ```
-# placeholder — replace with the real reproduction script invocation
-git clone <repo>
-cd duplex-agent
-# ... setup steps ...
-# ... run FDB-v3 against the agent ...
-```
+
+`TODO` — once this actually works end to end on our modified agent, wrap steps 1–4 into one script (`reproduce.sh` or similar) per the submission checklist's "one-command reproduction script" requirement. Two things worth flagging now, both squarely in **your** lane as the person testing this on a clean machine:
+
+1. **The benchmark data is a manual Google Drive download, not a git-tracked file or a `wget`-able URL.** A true "one command" script either needs to script that download (`gdown`, if the file permissions allow it) or the README needs to say clearly "download this first, by hand" — otherwise the org's re-run stalls on step 1 and that's 60% of the score at risk.
+2. **`nemo_toolkit[asr]` is a heavy dependency** (NVIDIA's ASR toolkit) and the original hackathon PRD mentioned a "single 48GB GPU" as the standard eval machine — worth confirming with P3 whether the ASR step needs that GPU or can run on CPU/smaller hardware, since "clean machine" for your test needs to match whatever the organizers actually run on.
+
+## The 12 mock tools (confirmed from FDB-v3)
+
+| Domain | Tools |
+|---|---|
+| Travel & Identity | `search_flights`, `book_flight`, `update_identity_doc` |
+| Finance & Billing | `get_card_benefits`, `get_exchange_rate`, `modify_autopay` |
+| Housing & Location | `search_apartments`, `calculate_commute`, `update_search_filter` |
+| E-Commerce | `track_order`, `search_products`, `add_to_cart` |
 
 ## Extension use case
 
@@ -114,4 +158,4 @@ cd duplex-agent
 
 **P3 — Benchmark Integration & Extension:** FDB-v3 setup, baseline run, one-command reproduction script, run logs, the extension use case.
 
-**P4 — README, Video, Slides, Test Runs:** This document, architecture diagram, demo video, slide deck, and independent verification of the reproduction script on a clean machine.
+**P4 — README, Video, Slides, Test Runs (Manas):** This document, architecture diagram, demo video, slide deck, and independent verification of the reproduction script on a clean machine.
