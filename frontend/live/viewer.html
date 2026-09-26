@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>duplex-agent — live trace</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --border: #30363d;
+    --text: #c9d1d9;
+    --dim: #8b949e;
+    --event: #58a6ff;
+    --filler: #8b949e;
+    --tool_call: #d29922;
+    --cancellation: #f85149;
+    --clarification_request: #a371f7;
+    --final_response: #3fb950;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+    display: flex;
+    height: 100vh;
+  }
+  #main {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+  header {
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; }
+  #status {
+    font-size: 12px;
+    padding: 2px 8px;
+    border-radius: 10px;
+    background: var(--panel);
+    color: var(--dim);
+    border: 1px solid var(--border);
+  }
+  #status.connected { color: var(--final_response); border-color: var(--final_response); }
+  #scenario-info { font-size: 12px; color: var(--dim); }
+  #timeline {
+    flex: 1;
+    overflow-y: auto;
+    padding: 12px 16px;
+  }
+  .row {
+    display: flex;
+    gap: 10px;
+    padding: 7px 10px;
+    margin-bottom: 4px;
+    border-radius: 6px;
+    border-left: 3px solid transparent;
+    background: var(--panel);
+    font-size: 13px;
+    align-items: flex-start;
+    animation: fadein 0.25s ease-out;
+  }
+  @keyframes fadein {
+    from { opacity: 0; transform: translateY(-4px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  .row .t { color: var(--dim); font-variant-numeric: tabular-nums; width: 58px; flex-shrink: 0; }
+  .row .badge {
+    flex-shrink: 0;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    padding: 1px 7px;
+    border-radius: 4px;
+    font-weight: 600;
+  }
+  .row .detail { flex: 1; word-break: break-word; }
+  .row .rev { color: var(--dim); font-size: 11px; flex-shrink: 0; }
+
+  .row.event { border-left-color: var(--event); }
+  .row.event .badge { background: rgba(88,166,255,0.15); color: var(--event); }
+
+  .row.filler { border-left-color: var(--filler); }
+  .row.filler .badge { background: rgba(139,148,158,0.15); color: var(--filler); }
+
+  .row.tool_call { border-left-color: var(--tool_call); }
+  .row.tool_call .badge { background: rgba(210,153,34,0.15); color: var(--tool_call); }
+
+  .row.cancellation { border-left-color: var(--cancellation); background: rgba(248,81,73,0.08); }
+  .row.cancellation .badge { background: rgba(248,81,73,0.2); color: var(--cancellation); }
+
+  .row.clarification_request { border-left-color: var(--clarification_request); }
+  .row.clarification_request .badge { background: rgba(163,113,247,0.15); color: var(--clarification_request); }
+
+  .row.final_response { border-left-color: var(--final_response); }
+  .row.final_response .badge { background: rgba(63,185,80,0.15); color: var(--final_response); }
+
+  .row.marker { background: transparent; justify-content: center; color: var(--dim); font-size: 12px; margin: 10px 0; }
+
+  #sidebar {
+    width: 280px;
+    flex-shrink: 0;
+    border-left: 1px solid var(--border);
+    padding: 16px;
+    overflow-y: auto;
+  }
+  #sidebar h2 { font-size: 12px; text-transform: uppercase; color: var(--dim); letter-spacing: 0.05em; margin: 0 0 10px; }
+  #state-box {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 12px;
+    font-size: 13px;
+  }
+  #state-box .rev-num { font-size: 22px; font-weight: 700; }
+  #state-box .field { margin-top: 8px; }
+  #state-box .field-label { color: var(--dim); font-size: 11px; text-transform: uppercase; }
+  .diff-line { color: var(--tool_call); font-size: 12px; margin-top: 2px; }
+  #clear-btn {
+    margin-top: 16px;
+    width: 100%;
+    padding: 6px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 12px;
+  }
+  #clear-btn:hover { border-color: var(--dim); }
+</style>
+</head>
+<body>
+
+<div id="main">
+  <header>
+    <h1>duplex-agent — live trace</h1>
+    <span id="status">connecting…</span>
+    <span id="scenario-info"></span>
+  </header>
+  <div id="timeline"></div>
+</div>
+
+<div id="sidebar">
+  <h2>Current state</h2>
+  <div id="state-box">
+    <div class="rev-num" id="rev-num">—</div>
+    <div class="field"><div class="field-label">Intent</div><div id="intent-val">—</div></div>
+    <div class="field"><div class="field-label">Slots</div><div id="slots-val">—</div></div>
+    <div class="field"><div class="field-label">Diff this revision</div><div id="diff-val">—</div></div>
+  </div>
+  <button id="clear-btn">Clear timeline</button>
+</div>
+
+<script>
+const WS_URL = "ws://localhost:8765";
+const timeline = document.getElementById("timeline");
+const statusEl = document.getElementById("status");
+const scenarioInfo = document.getElementById("scenario-info");
+let startTime = null;
+
+function connect() {
+  const ws = new WebSocket(WS_URL);
+
+  ws.onopen = () => {
+    statusEl.textContent = "connected";
+    statusEl.classList.add("connected");
+  };
+  ws.onclose = () => {
+    statusEl.textContent = "disconnected — retrying…";
+    statusEl.classList.remove("connected");
+    setTimeout(connect, 1500);
+  };
+  ws.onerror = () => ws.close();
+  ws.onmessage = (msg) => handleMessage(JSON.parse(msg.data));
+}
+
+function elapsed() {
+  if (startTime === null) startTime = performance.now();
+  return ((performance.now() - startTime) / 1000).toFixed(2) + "s";
+}
+
+function addRow(cssClass, badge, detail, rev) {
+  const row = document.createElement("div");
+  row.className = "row " + cssClass;
+  row.innerHTML = `
+    <div class="t">${elapsed()}</div>
+    <div class="badge">${badge}</div>
+    <div class="detail">${detail}</div>
+    ${rev !== undefined && rev !== null ? `<div class="rev">rev ${rev}</div>` : ""}
+  `;
+  timeline.appendChild(row);
+  timeline.scrollTop = timeline.scrollHeight;
+}
+
+function addMarker(text) {
+  const row = document.createElement("div");
+  row.className = "row marker";
+  row.textContent = text;
+  timeline.appendChild(row);
+  timeline.scrollTop = timeline.scrollHeight;
+}
+
+function describeEvent(e) {
+  switch (e.type) {
+    case "text_chunk": return `text_chunk: "${e.text ?? ""}"`;
+    case "interruption": return `interruption: "${e.interruption_text ?? ""}"`;
+    case "tool_result": return `tool_result for ${e.call_id ?? "?"} (success=${e.success})`;
+    case "audio_wav": return `audio_wav (${e.file_path ?? "raw bytes"})`;
+    case "video_frame": return `video_frame (${e.file_path ?? "raw bytes"})`;
+    case "tool_manifest": return `tool_manifest: ${JSON.stringify(e.manifest ?? {})}`;
+    default: return e.type;
+  }
+}
+
+function describeAction(a) {
+  switch (a.type) {
+    case "filler": return `"${a.filler_text ?? ""}"`;
+    case "tool_call": return `${a.tool_name} (${JSON.stringify(a.tool_args ?? {})}) — call_id=${a.call_id}`;
+    case "cancellation": return `cancelled ${a.cancelled_call_id} — ${a.reason ?? ""}`;
+    case "clarification_request": return `"${a.clarification_question ?? ""}"`;
+    case "final_response": return `"${a.response_text ?? ""}"`;
+    default: return a.type;
+  }
+}
+
+function renderState(s) {
+  document.getElementById("rev-num").textContent = "rev " + s.revision;
+  document.getElementById("intent-val").textContent = s.intent ?? "—";
+  const slots = s.slots ?? {};
+  document.getElementById("slots-val").textContent =
+    Object.keys(slots).length ? JSON.stringify(slots) : "—";
+  const diff = s.diff ?? [];
+  const diffEl = document.getElementById("diff-val");
+  diffEl.innerHTML = "";
+  if (!diff.length) {
+    diffEl.textContent = "—";
+  } else {
+    diff.forEach(d => {
+      const line = document.createElement("div");
+      line.className = "diff-line";
+      line.textContent = `${d.slot}: ${d.old_value ?? "∅"} → ${d.new_value ?? "∅"}`;
+      diffEl.appendChild(line);
+    });
+  }
+}
+
+function handleMessage(msg) {
+  if (msg.kind === "scenario_start") {
+    startTime = null;
+    timeline.innerHTML = "";
+    scenarioInfo.textContent = msg.name + " — " + msg.description;
+    addMarker("▶ scenario started: " + msg.name);
+  } else if (msg.kind === "event") {
+    addRow("event", "EVENT", describeEvent(msg.data));
+  } else if (msg.kind === "action") {
+    const a = msg.data;
+    addRow(a.type, a.type.toUpperCase(), describeAction(a), a.revision);
+  } else if (msg.kind === "state") {
+    renderState(msg.data);
+  } else if (msg.kind === "scenario_end") {
+    addMarker("■ scenario finished");
+    renderState(msg.final_state);
+  }
+}
+
+document.getElementById("clear-btn").onclick = () => { timeline.innerHTML = ""; };
+
+connect();
+</script>
+
+</body>
+</html>
