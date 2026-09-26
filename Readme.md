@@ -1,137 +1,117 @@
-# Interruptible Real-Time Agent
+# duplex-agent
 
 **Samsung PRISM — Theme 05: Interruptible Real-Time Agents**
 Team of 4 · 2-day build window
 
+> Status: skeleton — fill in as P1/P2/P3 land their pieces. Sections marked `TODO` need real content before submission.
+
 ## Problem
 
-An agent consumes a stream of timestamped events — text chunks, WAV clips, PNG frames, interruption signals, tool results, tool manifests — over an input queue, and produces actions — fillers, tool calls, cancellations, clarification requests, final responses with state snapshots — over an output queue.
+A voice-native agent, built inside the [LiveKit agents framework](https://github.com/livekit/agents), that:
 
-The hard requirements: no duplicate state-changing calls, no acting on stale (superseded) tool results, and no false claims of task completion.
+- **Stays responsive** — spoken feedback within a few hundred ms, no dead air, no false "done" claims
+- **Works asynchronously** — tool calls, perception, and reasoning never block the conversation
+- **Recovers cleanly** — mid-utterance corrections discard stale intent, update tool args, and never repeat a state-changing action
 
-We are **not** doing interruption *detection* from raw audio. Interruption signals arrive as explicit input events; this project is the decision and orchestration logic for what happens after one arrives.
+Evaluated against **[Full-Duplex-Bench v3 (FDB-v3)](https://github.com/DanielLin94144/Full-Duplex-Bench)** — a real, public benchmark ([paper](https://arxiv.org/abs/2604.04847)) of 100 human recordings across 79 scenarios, 12 speakers, 5 annotated disfluency types, and 12 mock tools across 4 domains with chained calls up to 3 levels deep.
 
-Scoring: Task Completion 40%, Interruption Recovery 35%, Response Latency 15%, Safety & Protocol 10% (see `PRD-interruptible-realtime-agent.md` for the full spec).
+Published baselines we're aiming to beat (or at least know where we land against):
+
+| Model | Strict Pass@1 | First response | Tool call latency | Task completion latency |
+|---|---|---|---|---|
+| GPT-Realtime | 60.0% | 6.36s | 3.89s | 6.89s |
+| Gemini Live 3.1 | 54.0% | 3.95s | 2.21s | 4.25s |
+| Cascaded (Whisper→GPT-4o→TTS) | — | — | — | 10.12s |
+
+The paper's headline finding — self-correction handling and multi-step tool chains are where every published system loses points — is exactly what our interruption-decision logic is meant to address.
 
 ## Architecture
 
-Raw `asyncio`, no framework, for full control over cancellation semantics.
+Cascaded template (STT → reasoning/decision → TTS), not a realtime speech API — chosen for 2 days / 4 people because it's easier to insert our own interruption-classification and state-management layer between STT and TTS.
 
+```mermaid
+flowchart LR
+    A[Microphone audio] --> B[STT]
+    B --> C{Interruption classifier}
+    C -->|continue| D[No action]
+    C -->|patch| E[Patch changed slot,\nkeep in-flight call if still valid]
+    C -->|cancel| F[Cancel in-flight call]
+    C -->|clarify| G[Ask before acting]
+    E --> H[Reasoning / tool selection]
+    F --> H
+    G --> H
+    H --> I[Idempotency ledger\nintent+slots+tool_name]
+    I --> J[Tool call\ntagged with state revision]
+    J --> K{Result still\ncurrent revision?}
+    K -->|yes| L[Update state snapshot + diff]
+    K -->|no, stale| M[Discard]
+    L --> N[TTS]
 ```
-Event (in) ──► Orchestrator ──► Action (out)
-                   │
-      ┌────────────┼─────────────┐
-      ▼            ▼             ▼
- TaskManager    Ledger      Reasoning layer
- (in-flight     (idempotency (intent/slot
-  calls by      by intent+   detection,
-  call_id,      slots+tool)  interruption
-  revision)                  classifier)
-```
 
-Every dispatched tool call is tagged with the state **revision** it was issued under. If a tool result comes back after the state has moved to a newer revision, it's discarded — regardless of whether `Task.cancel()` succeeded in time. This is the core mechanism behind the Interruption Recovery scoring criterion.
+Carried over from the original design, now living inside the LiveKit agent's reasoning stage:
 
-Interruptions are classified into exactly one of four types before any action is taken:
-
-| Type | Meaning | Action |
-|---|---|---|
-| `continue` | Benign aside | No action |
-| `patch` | Correction to a slot | Patch only that slot, keep in-flight call running if still valid |
-| `cancel` | Request is obsolete | Cancel in-flight call(s) |
-| `clarify` | Ambiguous | Ask before acting |
-
-**Default is `clarify` on low confidence** — a wrong guess costs Task Completion; asking for clarification doesn't.
+1. **Interruption classifier** — every interruption/self-correction is one of `continue` / `patch` / `cancel` / `clarify` before any action is taken. Defaults to `clarify` on low confidence (a wrong guess costs Task Completion; asking doesn't).
+2. **Versioned state snapshots** — `revision`, `intent`, `slots`, with a recorded diff on every correction.
+3. **Idempotency ledger** — keyed by `intent + normalized_slots + tool_name`; never repeats a state-changing tool call.
+4. **Revision-tagged tool calls** — a result from a superseded revision is discarded on arrival, regardless of whether cancellation succeeded first.
+5. **Cancellation** — wired to whatever concurrency primitive the LiveKit agent runtime uses for in-flight tool calls.
 
 ## Repo structure
 
-```
-schemas.py                 Shared contract: Event, Action, StateSnapshot, SlotDiff
-orchestrator/
-  loop.py                  Orchestrator — wires everything together (currently stubbed
-                            reasoning/multimodal calls; see Known Gaps below)
-  task_manager.py           Tracks in-flight asyncio tasks by call_id / revision
-  ledger.py                 Idempotency ledger: (intent, normalized_slots, tool_name) -> blocked if repeated
-  cancellation.py            handle_cancel_decision, is_result_stale
-reasoning/                  Intent/slot extraction + interruption classifier (P2 — in progress)
-multimodal/                 WAV/PNG processors, tool manifest parser (P3 — in progress)
-frontend/
-  harness.py                 Test harness: drives the orchestrator with timed Event
-                              sequences, captures the full Action trace + final state
-  scenarios.py                Scenario definitions used by both the harness and the
-                              live viewer (see Known Gaps — these are NOT yet the
-                              official 9 public scenarios)
-  run_tests.py                 CLI: runs all scenarios, prints pass/fail summary
-  live/
-    server.py                  WebSocket server — runs a scenario live, streams every
-                                event/action/state change to the browser in real time
-    viewer.html                 Browser page — renders the live stream as a color-coded
-                                timeline with a live state/diff panel
-test_ledger.py, test_cancellation.py   Unit tests for the modules above
-main.py                     Entry point — placeholder until Day 2 integration
-```
+`TODO` — fill in once P1's LiveKit agent skeleton lands.
 
-## Setup
+## Setup & run
+
+`TODO` — one-command reproduction script goes here once P3 builds it. Must be tested on a machine that isn't the dev machine (P4's job) before submission — 60% of the score is a re-run of this by the organizers.
 
 ```
-git clone https://github.com/srishti-1935/interruptible-real-time-agents.git
-cd interruptible-real-time-agents
-python -m venv venv
-venv\Scripts\activate        # Windows
-source venv/bin/activate     # Mac/Linux
-pip install -r requirements.txt
-pip install websockets       # only needed for the live trace viewer
+# placeholder — replace with the real reproduction script invocation
+git clone <repo>
+cd duplex-agent
+# ... setup steps ...
+# ... run FDB-v3 against the agent ...
 ```
 
-## Running things
+## Extension use case
 
-**Sanity-check the orchestrator skeleton on its own:**
-```
-python -m orchestrator.loop
-```
-Prints one stubbed filler action if everything's wired correctly.
+`TODO` — one new use case beyond the benchmark's 4 domains, working end-to-end, shown in the demo video (not a slide sketch). Candidates from the PRD: in-car destination change, device troubleshooting with a camera frame, hands-free kitchen assistant. P3 picks and builds one fully rather than splitting effort.
 
-**Run the scenario test suite:**
-```
-python -m frontend.run_tests
-```
-Prints a pass/fail table. Failures marked "known gap" are documented integration gaps (see below), not regressions.
+## Benchmark results
 
-**Run the live trace viewer:**
-```
-python -m frontend.live.server              # starts the WebSocket server
-```
-Then open `frontend/live/viewer.html` in a browser, wait for the status pill to say "connected," and press Enter in the terminal to fire the scenario. Use `--scenario NAME` to pick a specific one, or `--list` to see all scenario names.
-
-**Unit tests:**
-```
-python -m pytest test_ledger.py test_cancellation.py
-```
+`TODO` — our best run's scores, seeds, and config, once P3 has FDB-v3 running end-to-end against the complete agent (Day 2 AM per the timeline).
 
 ## Status
 
 | Module | Owner | Status |
 |---|---|---|
-| P1 — Core orchestrator | — | Skeleton complete, runs end to end with stubs |
-| P2 — Reasoning & decision layer | — | In progress — intent/slot extraction and the real interruption classifier are not yet wired in |
-| P3 — Multimodal & tool layer | — | In progress |
-| P4 — Frontend / demo / test runner | Manas | Test harness, scenario suite, live trace viewer, this README |
+| P1 — LiveKit agent core + orchestration logic | — | Not started |
+| P2 — Reasoning & tool-calling | — | Not started |
+| P3 — Benchmark integration & extension | — | Not started |
+| P4 — README, video, slides, test runs | Manas | This README skeleton |
 
-## Known gaps
+## Hard constraints (disqualification risks)
 
-These are structural gaps in the current stub loop, surfaced by the test suite — flagged here so they don't get lost before Day 2 integration:
+- Never hardcode/memorize/fine-tune on FDB-v3 test items — it's public, they check
+- No calling our own servers at evaluation time — all agent logic must live in the submission
+- No caching across scenarios — each conversation starts fresh
+- Pin seeds and versions so the organizers' re-run matches our logs
 
-1. **Tool dispatch is currently unreachable.** `orchestrator/loop.py`'s `_handle_input_turn` hardcodes `parsed["tool_name"] = None`, so no text input can currently trigger a real tool call, and the ledger/task_manager dispatch path is untested end-to-end via events (though it is unit-tested directly — see `test_ledger.py`, `test_cancellation.py`, and the harness's `stale_tool_result_after_revision_bump` scenario, which seeds a dispatch manually to work around this).
-2. **`patch` doesn't record a diff.** The `patch` branch in `_handle_interruption` bumps `StateSnapshot.revision` but never populates `.diff`, so "patch only the changed slot(s)" isn't observable in the state snapshot yet.
-3. **The interruption classifier is hardcoded to always return `clarify`.** This is the correct *default*, but means every interruption currently produces the same response regardless of content — the real four-way classification (rules pass + LLM fallback) is P2's work.
-4. **Multimodal event shape is underspecified.** `Event.raw_bytes` vs `Event.file_path` for `audio_wav`/`video_frame` is currently either/or with no stated convention — worth confirming with P3 before building a real test harness for those event types.
-5. **Test scenarios are placeholders.** `frontend/scenarios.py` currently holds structural smoke tests and staleness/race-condition checks written to validate the harness itself — not the official 9 public scenarios from the challenge. Those should replace/extend this file once available.
+## Submission checklist
+
+- [ ] Code repo with this README (architecture diagram, exact setup/run steps, extension clearly marked)
+- [ ] One-command reproduction script, verified on a clean machine
+- [ ] Our own benchmark run logs (scores, seeds, config)
+- [ ] Extension use case, working end-to-end, shown in the video
+- [ ] Demo video, 3–5 min, unedited single takes preferred
+- [ ] Slide deck, max 8 slides
+- [ ] Submitted via the Google Form (one final upload counts)
 
 ## Team
 
-**P1 — Core Orchestrator:** Event loop, queues, task manager, cancellation wiring, revision tagging, idempotency ledger.
+**P1 — LiveKit Agent Core + Orchestration Logic:** LiveKit setup, interruption classifier wiring, state/revision system, idempotency ledger, tool-call cancellation.
 
-**P2 — Reasoning & Decision Layer:** Slow-path LLM (intent/slot extraction, tool selection, JSON schema), interruption classifier.
+**P2 — Reasoning & Tool-Calling:** LLM intent detection, slot extraction, tool selection against FDB-v3's 12 mock tools, structured state-snapshot output.
 
-**P3 — Multimodal & Tool Layer:** WAV→transcript, PNG→visual description, tool manifest parser, mock tool execution.
+**P3 — Benchmark Integration & Extension:** FDB-v3 setup, baseline run, one-command reproduction script, run logs, the extension use case.
 
-**P4 — Frontend / Demo / Test Runner (Manas):** Trace viewer (static trace + live), continuous test runner against the scenario suite, this README.
+**P4 — README, Video, Slides, Test Runs:** This document, architecture diagram, demo video, slide deck, and independent verification of the reproduction script on a clean machine.
