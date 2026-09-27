@@ -1,31 +1,16 @@
-"""
-Core event loop for duplex-agent.
-
-Wires together:
-- task manager
-- cancellation/staleness
-- idempotency ledger
-- multimodal preprocessing
-- P2 reasoning pipeline
-"""
-
 import asyncio
 
-from schemas import Event, EventType, Action, ActionType, StateSnapshot
-
+from schemas import Event, EventType, Action, ActionType, StateSnapshot, SlotDiff
 from orchestrator.task_manager import TaskManager
 from orchestrator.cancellation import handle_cancel_decision, is_result_stale
 from orchestrator.ledger import already_dispatched, record_dispatch
 from orchestrator.manifest_store import store_manifest
-
 from multimodal.speech import wav_to_text_event
 from multimodal.vision import png_to_text_event
-
 from reasoning.pipeline import process_text
 
 
 class Orchestrator:
-
     def __init__(self):
         self.task_manager = TaskManager()
         self.state = StateSnapshot(
@@ -34,11 +19,7 @@ class Orchestrator:
             slots={},
         )
 
-    async def handle_event(
-        self,
-        event: Event,
-        output_queue: asyncio.Queue,
-    ):
+    async def handle_event(self, event, output_queue):
         if event.type == EventType.AUDIO_WAV:
             event = wav_to_text_event(event)
             await self._handle_input_turn(event, output_queue)
@@ -59,28 +40,12 @@ class Orchestrator:
         elif event.type == EventType.TOOL_MANIFEST:
             store_manifest(event.manifest)
 
-    async def _handle_input_turn(
-        self,
-        event: Event,
-        output_queue: asyncio.Queue,
-    ):
-        """
-        Send text to the P2 reasoning pipeline.
-
-        The pipeline performs:
-        intent detection
-        -> slot extraction
-        -> argument validation
-        -> tool-call construction
-        -> clarification if information is missing
-        """
-
+    async def _handle_input_turn(self, event, output_queue):
         if not event.text:
             await output_queue.put(
                 Action(
                     type=ActionType.CLARIFICATION_REQUEST,
-                    clarification_question="I didn't receive any text. Could you try again?",
-                    ambiguous_slots=[],
+                    clarification_question="Could you clarify what you'd like me to do?",
                     revision=self.state.revision,
                 )
             )
@@ -91,7 +56,6 @@ class Orchestrator:
             revision=self.state.revision,
         )
 
-        # Update reasoning state.
         self.state = StateSnapshot(
             revision=self.state.revision,
             intent=result.intent,
@@ -100,8 +64,6 @@ class Orchestrator:
 
         action = result.action
 
-        # If this is a tool call, dispatch it through the
-        # existing orchestrator mechanism.
         if action.type == ActionType.TOOL_CALL:
             parsed = {
                 "intent": result.intent,
@@ -116,14 +78,9 @@ class Orchestrator:
             )
             return
 
-        # Otherwise forward clarification/filler/etc.
         await output_queue.put(action)
 
-    async def _dispatch_tool_call(
-        self,
-        parsed: dict,
-        output_queue: asyncio.Queue,
-    ):
+    async def _dispatch_tool_call(self, parsed, output_queue):
         intent = parsed["intent"]
         slots = parsed["slots"]
         tool_name = parsed["tool_name"]
@@ -135,13 +92,9 @@ class Orchestrator:
         ):
             return
 
-        call_id = (
-            f"call_{self.state.revision}_{tool_name}"
-        )
+        call_id = f"call_{self.state.revision}_{tool_name}"
 
         async def fake_tool_call():
-            # Temporary placeholder until P3's
-            # real tool execution wrapper is connected.
             await asyncio.sleep(0.5)
             return {"status": "ok"}
 
@@ -160,30 +113,18 @@ class Orchestrator:
             call_id,
         )
 
-        action = Action(
-            type=ActionType.TOOL_CALL,
-            call_id=call_id,
-            tool_name=tool_name,
-            tool_args=parsed["tool_args"],
-            revision=self.state.revision,
+        await output_queue.put(
+            Action(
+                type=ActionType.TOOL_CALL,
+                call_id=call_id,
+                tool_name=tool_name,
+                tool_args=parsed["tool_args"],
+                revision=self.state.revision,
+            )
         )
 
-        await output_queue.put(action)
-
-    async def _handle_interruption(
-        self,
-        event: Event,
-        output_queue: asyncio.Queue,
-    ):
-        """
-        Classify an interruption.
-
-        Current P2 classifier is rule-based and returns:
-        continue / patch / cancel / clarify
-        """
-
+    async def _handle_interruption(self, event, output_queue):
         text = event.interruption_text or ""
-
         classification = self._classify_interruption(text)
 
         if classification == "continue":
@@ -205,6 +146,15 @@ class Orchestrator:
                         reason="user cancelled request",
                     )
                 )
+            else:
+                await output_queue.put(
+                    Action(
+                        type=ActionType.CLARIFICATION_REQUEST,
+                        clarification_question=(
+                            "Could you clarify what you'd like me to cancel?"
+                        ),
+                    )
+                )
 
         elif classification == "patch":
             result = process_text(
@@ -216,16 +166,42 @@ class Orchestrator:
             new_slots = dict(old_slots)
             new_slots.update(result.slots)
 
+            # Handle partial slot updates from interruptions.
+            if not result.slots:
+                lower_text = text.lower()
+
+                if "destination is " in lower_text:
+                    destination = text.split("destination is ", 1)[1].strip()
+                    new_slots["destination"] = destination
+
+            diff = []
+
+            for slot in set(old_slots) | set(new_slots):
+                old_value = old_slots.get(slot)
+                new_value = new_slots.get(slot)
+
+                if old_value != new_value:
+                    diff.append(
+                        SlotDiff(
+                            slot=slot,
+                            old_value=old_value,
+                            new_value=new_value,
+                        )
+                    )
+
             self.state = StateSnapshot(
                 revision=self.state.revision + 1,
                 intent=result.intent or self.state.intent,
                 slots=new_slots,
+                diff=diff,
             )
 
             await output_queue.put(
                 Action(
                     type=ActionType.FILLER,
                     filler_text="I'm updating that.",
+                    revision=self.state.revision,
+                    state_snapshot=self.state,
                 )
             )
 
@@ -233,21 +209,13 @@ class Orchestrator:
             await output_queue.put(
                 Action(
                     type=ActionType.CLARIFICATION_REQUEST,
-                    clarification_question=(
-                        "Could you clarify what you meant?"
-                    ),
+                    clarification_question="Could you clarify what you meant?",
+                    revision=self.state.revision,
                 )
             )
 
     @staticmethod
-    def _classify_interruption(text: str) -> str:
-        """
-        Lightweight interruption classifier.
-
-        This is intentionally conservative until the final
-        P2/P3 classifier interface is agreed upon.
-        """
-
+    def _classify_interruption(text):
         text = text.lower().strip()
 
         if not text:
@@ -264,15 +232,20 @@ class Orchestrator:
         if any(word in text for word in cancel_words):
             return "cancel"
 
-        patch_words = [
-            "actually",
-            "instead",
-            "change",
+        patch_phrases = [
+            "actually the",
+            "actually make",
+            "actually change",
+            "instead make",
+            "instead use",
+            "change the",
+            "change it to",
             "make it",
-            "no,",
+            "no, the",
+            "no, change",
         ]
 
-        if any(word in text for word in patch_words):
+        if any(phrase in text for phrase in patch_phrases):
             return "patch"
 
         continue_words = [
@@ -286,11 +259,7 @@ class Orchestrator:
 
         return "clarify"
 
-    async def _handle_tool_result(
-        self,
-        event: Event,
-        output_queue: asyncio.Queue,
-    ):
+    async def _handle_tool_result(self, event, output_queue):
         if is_result_stale(
             event.call_id,
             self.state.revision,
@@ -305,56 +274,3 @@ class Orchestrator:
                 state_snapshot=self.state,
             )
         )
-
-
-async def process_events(
-    input_queue: asyncio.Queue,
-    output_queue: asyncio.Queue,
-):
-    orchestrator = Orchestrator()
-
-    while True:
-        event: Event = await input_queue.get()
-
-        if event is None:
-            input_queue.task_done()
-            break
-
-        await orchestrator.handle_event(
-            event,
-            output_queue,
-        )
-
-        input_queue.task_done()
-
-
-async def main():
-    input_queue: asyncio.Queue = asyncio.Queue()
-    output_queue: asyncio.Queue = asyncio.Queue()
-
-    consumer_task = asyncio.create_task(
-        process_events(
-            input_queue,
-            output_queue,
-        )
-    )
-
-    await input_queue.put(
-        Event(
-            type=EventType.TEXT_CHUNK,
-            text="book a flight to Mumbai",
-            is_end_of_turn=True,
-        )
-    )
-
-    await input_queue.put(None)
-
-    await consumer_task
-
-    while not output_queue.empty():
-        action = await output_queue.get()
-        print(action)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
