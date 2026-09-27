@@ -11,6 +11,8 @@ and should replace/extend this file once available. What's here instead:
      even though the event-driven path to reach it doesn't exist yet —
      these use `setup()` to seed state directly, bypassing the stub.
   3. One race-condition scenario per the Day 2 PM stress-test list.
+  4. The team's extension use case (in-car destination change), proven
+     against the same staleness/cancellation guarantees as the core tools.
 
 Each scenario marked `known_gap=...` documents a real integration gap in
 the current loop, not a bug in this test file. See the printed summary's
@@ -21,6 +23,7 @@ from __future__ import annotations
 
 from schemas import Event, EventType, ActionType, StateSnapshot
 from orchestrator.loop import Orchestrator
+from orchestrator.cancellation import handle_cancel_decision
 from frontend.harness import Scenario, Trace
 
 
@@ -176,6 +179,37 @@ SCENARIOS: list[Scenario] = [
         ],
         checks=[stale_result_produces_no_final_response],
     ),
+
+    Scenario(
+        name="extension_destination_change_discards_stale_route_search",
+        description=(
+            "Extension use case (in-car destination change): a search_route call "
+            "for the old destination is in flight when the user changes destination. "
+            "The old call is cancelled and, even if its result arrives late, it must "
+            "be discarded rather than acted on — same staleness guarantee as the "
+            "core benchmark tools, now proven for the extension's own tool outside "
+            "FDB-v3's 12 domains."
+        ),
+        setup=lambda orch: (
+            orch.task_manager.dispatch(
+                "call_0_search_route",
+                _fake_slow_route_call(),
+                revision=0, tool_name="search_route", normalized_slots={"destination": "Bangalore"},
+            ),
+            handle_cancel_decision("call_0_search_route", orch.task_manager),
+            setattr(orch, "state", StateSnapshot(revision=1, intent="navigate", slots={"destination": "Chennai"})),
+        ),
+        steps=[
+            (0, Event(
+                type=EventType.TOOL_RESULT,
+                call_id="call_0_search_route",
+                tool_name="search_route",
+                result_payload={"status": "success", "route_id": "ROUTE_BANG"},
+                success=True,
+            )),
+        ],
+        checks=[stale_result_produces_no_final_response],
+    ),
 ]
 
 
@@ -183,3 +217,9 @@ async def _fake_slow_call():
     import asyncio
     await asyncio.sleep(0.05)
     return {"status": "ok"}
+
+
+async def _fake_slow_route_call():
+    import asyncio
+    await asyncio.sleep(0.05)
+    return {"status": "success", "route_id": "ROUTE_BANG"}
