@@ -12,6 +12,9 @@ from schemas import Event, EventType, Action, ActionType, StateSnapshot
 from orchestrator.task_manager import TaskManager
 from orchestrator.cancellation import handle_cancel_decision, is_result_stale
 from orchestrator.ledger import already_dispatched, record_dispatch
+from orchestrator.manifest_store import store_manifest
+from multimodal.speech import wav_to_text_event
+from multimodal.vision import png_to_text_event
 
 
 class Orchestrator:
@@ -20,7 +23,15 @@ class Orchestrator:
         self.state = StateSnapshot(revision=0, intent=None, slots={})
 
     async def handle_event(self, event: Event, output_queue: asyncio.Queue):
-        if event.type in (EventType.TEXT_CHUNK, EventType.AUDIO_WAV, EventType.VIDEO_FRAME):
+        if event.type == EventType.AUDIO_WAV:
+            event = wav_to_text_event(event)
+            await self._handle_input_turn(event, output_queue)
+
+        elif event.type == EventType.VIDEO_FRAME:
+            event = png_to_text_event(event)
+            await self._handle_input_turn(event, output_queue)
+
+        elif event.type == EventType.TEXT_CHUNK:
             await self._handle_input_turn(event, output_queue)
 
         elif event.type == EventType.INTERRUPTION:
@@ -30,8 +41,7 @@ class Orchestrator:
             await self._handle_tool_result(event, output_queue)
 
         elif event.type == EventType.TOOL_MANIFEST:
-            # TODO: hand off to P3's manifest parser, store schema/read-only flag
-            pass
+            store_manifest(event.manifest)
 
     async def _handle_input_turn(self, event: Event, output_queue: asyncio.Queue):
         # TODO: send event (or P3's processed transcript/description) to P2's LLM
@@ -51,7 +61,6 @@ class Orchestrator:
         slots = parsed["slots"]
         tool_name = parsed["tool_name"]
 
-        # TODO: check tool_manifest's read_only flag here — only gate state-modifying calls
         if already_dispatched(intent, slots, tool_name):
             return  # duplicate, silently skip
 
@@ -107,7 +116,6 @@ class Orchestrator:
             ))
 
     async def _handle_tool_result(self, event: Event, output_queue: asyncio.Queue):
-        incoming_revision = self.task_manager.get_revision(event.call_id)
         if is_result_stale(event.call_id, self.state.revision, self.task_manager):
             return  # discard silently
 
