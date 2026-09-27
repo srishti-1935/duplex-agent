@@ -140,16 +140,6 @@ bash run_all_evaluations_released.sh                                # Terminal 2
 - No caching across scenarios — each conversation starts fresh
 - Pin seeds and versions so the organizers' re-run matches our logs
 
-## Submission checklist
-
-- [ ] Code repo with this README (architecture diagram, exact setup/run steps, extension clearly marked)
-- [ ] One-command reproduction script, verified on a clean machine
-- [ ] Our own benchmark run logs (scores, seeds, config)
-- [ ] Extension use case, working end-to-end, shown in the video
-- [ ] Demo video, 3–5 min, unedited single takes preferred
-- [ ] Slide deck, max 8 slides
-- [ ] Submitted via the Google Form (one final upload counts)
-
 ## Team
 
 **P1 — LiveKit Agent Core + Orchestration Logic:** LiveKit setup, interruption classifier wiring, state/revision system, idempotency ledger, tool-call cancellation.
