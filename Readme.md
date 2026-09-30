@@ -3,7 +3,7 @@
 **Samsung PRISM — Theme 05: Interruptible Real-Time Agents**
 Team of 4 · 2-day build window
 
-> Status: skeleton — fill in as P1/P2/P3 land their pieces. Sections marked `TODO` need real content before submission.
+Demo Video: https://drive.google.com/file/d/13Hgcy1CwSp9RGsvBfq1ccvROT2fCFhse/view?usp=sharing
 
 ## Problem
 
