@@ -3,7 +3,7 @@
 **Samsung PRISM — Theme 05: Interruptible Real-Time Agents**
 Team of 4 · 2-day build window
 
-Demo Video: https://drive.google.com/file/d/13Hgcy1CwSp9RGsvBfq1ccvROT2fCFhse/view?usp=sharing
+Demo Video: https://youtu.be/EmWn4vT35p4
 
 ## Problem
 
