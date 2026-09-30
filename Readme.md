@@ -307,7 +307,7 @@ The project specifically focuses on the failure modes caused by **self-correctio
 
 ---
 
-## 🔧 Mock Tool Domains
+##  Mock Tool Domains
 
 | Domain             | Example Tools                                                    |
 | ------------------ | ---------------------------------------------------------------- |
