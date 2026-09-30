@@ -1,151 +1,358 @@
-# duplex-agent
+# Duplex Agent
+
+> **Event-driven orchestration for interruptible real-time AI agents with versioned state, cancellation, stale-result protection, and idempotent tool execution.**
 
 **Samsung PRISM — Theme 05: Interruptible Real-Time Agents**
-Team of 4 · 2-day build window
+**Team size:** 4
+**Role:** P4 — README, demo video, slides & verification
 
+<<<<<<< Updated upstream
 Demo Video: https://youtu.be/EmWn4vT35p4
+=======
+---
+>>>>>>> Stashed changes
 
-## Problem
+##  Demo
 
-A voice-native agent, built inside the [LiveKit agents framework](https://github.com/livekit/agents), that:
+The demo shows the agent handling an interruption in the middle of a tool-driven task, updating the state revision, protecting against stale results, and recording the resulting tool execution in the ledger.
 
-- **Stays responsive** — spoken feedback within a few hundred ms, no dead air, no false "done" claims
-- **Works asynchronously** — tool calls, perception, and reasoning never block the conversation
-- **Recovers cleanly** — mid-utterance corrections discard stale intent, update tool args, and never repeat a state-changing action
+### Demo Video
 
-Evaluated against **[Full-Duplex-Bench v3 (FDB-v3)](https://github.com/DanielLin94144/Full-Duplex-Bench)** — a real, public benchmark ([paper](https://arxiv.org/abs/2604.04847)) of 100 human recordings across 79 scenarios, 12 speakers, 5 annotated disfluency types, and 12 mock tools across 4 domains with chained calls up to 3 levels deep.
+> **Note:** After uploading the video to GitHub, replace `VIDEO_URL_HERE` with the GitHub-generated video URL.
 
-Published baselines we're aiming to beat (or at least know where we land against):
+<video src="VIDEO_URL_HERE" controls width="100%"></video>
 
-| Model | Strict Pass@1 | First response | Tool call latency | Task completion latency |
-|---|---|---|---|---|
-| GPT-Realtime | 60.0% | 6.36s | 3.89s | 6.89s |
-| Gemini Live 3.1 | 54.0% | 3.95s | 2.21s | 4.25s |
-| Cascaded (Whisper→GPT-4o→TTS) | — | — | — | 10.12s |
+**[▶ Watch the Full Demo](VIDEO_URL_HERE)**
 
-The paper's headline finding — self-correction handling and multi-step tool chains are where every published system loses points — is exactly what our interruption-decision logic is meant to address.
+### What the Demo Shows
 
-## Architecture
+* Initial request: **“Find me a flight to Mumbai on October 4.”**
+* The agent dispatches a `flight_search` tool call for revision `v1`.
+* The user interrupts: **“Actually make that October 5.”**
+* The interruption is classified as a **PATCH** rather than a new independent task.
+* Only the changed slot (`date`) is updated.
+* State advances from **revision `v1` → `v2`**.
+* The stale `v1` result is protected from becoming the final state.
+* The `v2` tool call completes and is recorded by the **Tool Ledger**.
 
-Cascaded template (STT → reasoning/decision → TTS), not a realtime speech API — chosen for 2 days / 4 people because it's easier to insert our own interruption-classification and state-management layer between STT and TTS.
+---
+
+##  The Problem
+
+Real-time AI agents cannot behave like ordinary request/response applications.
+
+While an agent is reasoning or executing a tool call, the user can change their mind, correct a value, cancel the request, or add new information. A naive implementation can then:
+
+* execute outdated tool calls,
+* overwrite newer state with stale results,
+* repeat state-changing actions,
+* lose track of which version of the user's intent is active, or
+* become unresponsive while waiting for tools.
+
+**Duplex Agent** introduces an event-driven orchestration layer that treats every correction as a state transition and every tool result as valid only for the revision that created it.
+
+---
+
+##  Core Capabilities
+
+| Capability                      | Purpose                                                                  |
+| ------------------------------- | ------------------------------------------------------------------------ |
+| **Interruption classification** | Classifies interruptions as `continue`, `patch`, `cancel`, or `clarify`. |
+| **Versioned state**             | Every meaningful correction produces a new state revision.               |
+| **Stale-result protection**     | Results from superseded revisions cannot overwrite current state.        |
+| **Cancellation**                | In-flight work can be cancelled when the active intent changes.          |
+| **Idempotency ledger**          | Prevents duplicate state-changing tool execution.                        |
+| **Revision-tagged tools**       | Every tool call carries the state revision that created it.              |
+| **State diffs**                 | Corrections expose exactly what changed between revisions.               |
+| **Event stream**                | Makes the complete orchestration lifecycle observable.                   |
+| **Tool ledger**                 | Records dispatched operations, revisions, status and idempotency keys.   |
+
+---
+
+##  Architecture
 
 ```mermaid
 flowchart LR
-    A[Microphone audio] --> B[STT]
-    B --> C{Interruption classifier}
-    C -->|continue| D[No action]
-    C -->|patch| E[Patch changed slot,\nkeep in-flight call if still valid]
-    C -->|cancel| F[Cancel in-flight call]
-    C -->|clarify| G[Ask before acting]
-    E --> H[Reasoning / tool selection]
+    A[Microphone / User Input] --> B[STT]
+    B --> C{Interruption Classifier}
+
+    C -->|continue| D[Continue Current Task]
+    C -->|patch| E[Patch Changed Slot]
+    C -->|cancel| F[Cancel In-Flight Work]
+    C -->|clarify| G[Ask User]
+
+    E --> H[Versioned State]
     F --> H
     G --> H
-    H --> I[Idempotency ledger\nintent+slots+tool_name]
-    I --> J[Tool call\ntagged with state revision]
-    J --> K{Result still\ncurrent revision?}
-    K -->|yes| L[Update state snapshot + diff]
-    K -->|no, stale| M[Discard]
-    L --> N[TTS]
+    D --> H
+
+    H --> I[Reasoning / Tool Selection]
+    I --> J[Idempotency Ledger]
+    J --> K[Revision-Tagged Tool Call]
+    K --> L{Result Matches Current Revision?}
+
+    L -->|Yes| M[Update State + Diff]
+    L -->|No| N[Discard Stale Result]
+
+    M --> O[TTS / Response]
 ```
 
-Carried over from the original design, now living inside the LiveKit agent's reasoning stage:
+### State Lifecycle
 
-1. **Interruption classifier** — every interruption/self-correction is one of `continue` / `patch` / `cancel` / `clarify` before any action is taken. Defaults to `clarify` on low confidence (a wrong guess costs Task Completion; asking doesn't).
-2. **Versioned state snapshots** — `revision`, `intent`, `slots`, with a recorded diff on every correction.
-3. **Idempotency ledger** — keyed by `intent + normalized_slots + tool_name`; never repeats a state-changing tool call.
-4. **Revision-tagged tool calls** — a result from a superseded revision is discarded on arrival, regardless of whether cancellation succeeded first.
-5. **Cancellation** — wired to whatever concurrency primitive the LiveKit agent runtime uses for in-flight tool calls.
-
-## Repo structure
-
-`TODO` — fill in once P1's LiveKit agent skeleton lands. For reference, the FDB-v3 harness itself (which our agent plugs into) is laid out like this — our own code most likely lives as a modified `cascaded_agent.py` plus whatever new modules P1/P2 add for the classifier/ledger/state logic:
-
-```
-v3/
-├── cascaded_agent.py                    # <- our starting point: Silero VAD + Whisper STT + gpt-4o + OpenAI TTS
-├── lk_agent_tool.py                     # native realtime agent (GPT Realtime/Gemini/Grok/Ultravox) — not our path
-├── mock_apis.py                         # the 12 mock tool backends
-├── benchmark_data_v2.json               # 79 scenario definitions
-├── run_tool_benchmark_all_released.py   # batch inference — streams all 100 recordings through our agent
-├── evaluate_tool_calls.py               # F1 / argument accuracy / response quality
-├── evaluate_pass_rate.py                # strict binary pass/fail
-├── analyze_tool_latency.py              # latency breakdown
-└── fdb_v3_data_released/                # benchmark audio + metadata (downloaded separately, not in git)
+```text
+User intent
+    ↓
+State v1
+    ↓
+Tool call tagged v1
+    ↓
+User correction
+    ↓
+PATCH / CANCEL / CLARIFY
+    ↓
+State v2
+    ↓
+New tool call tagged v2
+    ↓
+Validate returned revision
+    ├── current → accept
+    └── stale   → discard
 ```
 
-## Setup & run
+---
 
-Confirmed from the actual FDB-v3 `v3/README.md`:
+##  Interruption Handling
+
+The orchestration layer separates **what the user changed** from **what the agent should do next**.
+
+### Example
+
+```text
+Initial request
+"Find me a flight to Mumbai on October 4."
+
+        ↓
+
+Tool call
+flight_search @ revision v1
+
+        ↓
+
+Interruption
+"Actually make that October 5."
+
+        ↓
+
+Decision
+PATCH
+
+        ↓
+
+State update
+October 4 → October 5
+revision v1 → v2
+
+        ↓
+
+Result validation
+v1 result → STALE → discard
+v2 result → CURRENT → accept
+```
+
+This prevents an older asynchronous result from silently becoming the final answer after the user has already corrected their request.
+
+---
+
+##  Idempotency & Stale-Result Protection
+
+Every tool execution is associated with an idempotency key derived from the active intent, normalized slots and tool name.
+
+```text
+intent + normalized_slots + tool_name
+                 ↓
+          idempotency key
+                 ↓
+          tool execution
+```
+
+Tool results are also associated with a state revision:
+
+```text
+Request → revision v1 → tool call
+Correction → revision v2 → new tool call
+
+v1 result arrives after v2
+             ↓
+        revision mismatch
+             ↓
+       discard as stale
+```
+
+The combination of **revision checking + idempotency tracking** protects the agent from two different classes of race conditions: outdated results and duplicate execution.
+
+---
+
+##  Demo Interface
+
+The current demo provides three operational views:
+
+### Trace Studio
+
+Observe the complete event stream, current state revision, tool calls, interruptions and protection decisions in real time.
+
+### Scenarios
+
+Replay predefined interruption scenarios and inspect the expected decision, live events and resulting state snapshot.
+
+### Tool Ledger
+
+Inspect dispatched tool operations, revisions, completion status, stale results and idempotency keys.
+
+---
+
+##  Repository Structure
+
+```text
+.
+├── frontend/              # Demo / visualization interface
+├── multimodal/            # Multimodal components
+├── orchestrator/          # Event-driven orchestration and state handling
+├── reasoning/             # Reasoning and tool-selection components
+├── extension_tools.py     # Tool extensions
+├── main.py                # Main application entry point
+├── schemas.py             # Shared data schemas
+├── simulate_extension.py  # Extension simulation
+├── test_cancellation.py   # Cancellation tests
+├── test_ledger.py         # Ledger / idempotency tests
+├── requirements.txt       # Python dependencies
+└── Readme.md              # Project documentation
+```
+
+---
+
+##  Setup
+
+### 1. Clone the Repository
 
 ```bash
-# 1. Environment
-conda create -n fdb python=3.10 && conda activate fdb
-pip install "livekit-agents[openai,google,xai]~=1.3" "livekit-plugins-ultravox" python-dotenv
-pip install "livekit-plugins-silero" "livekit-plugins-openai"   # cascaded agent deps
-pip install "livekit[crypto]~=1.0" numpy
-pip install nemo_toolkit[asr]        # ASR model used to transcribe the agent's spoken response for eval
-pip install pydub ffmpeg-python openai
-# external: ffmpeg (apt install ffmpeg / brew install ffmpeg)
-
-# 2. .env.local in v3/
-# LIVEKIT_URL / LIVEKIT_API_KEY / LIVEKIT_API_SECRET   (free LiveKit Cloud account)
-# OPENAI_API_KEY                                        (cascaded agent + gpt-4o judge)
-
-# 3. Benchmark data — NOT in git, download manually:
-# https://drive.google.com/file/d/1SO_4MTazWQ_jvCx0dtmpQ-t40bdd07yz/view
-# extract fdb_v3_data_released/ into v3/
-
-# 4. Run — three terminals worth of steps, in order:
-cd v3
-python cascaded_agent.py start                                    # Terminal 1: our agent, stays running
-python run_tool_benchmark_all_released.py --provider cascaded      # Terminal 2: batch inference, all 100 recordings
-bash run_all_evaluations_released.sh                                # Terminal 2, after inference finishes: scoring
+git clone https://github.com/srishti-1935/duplex-agent.git
+cd duplex-agent
 ```
 
-`TODO` — once this actually works end to end on our modified agent, wrap steps 1–4 into one script (`reproduce.sh` or similar) per the submission checklist's "one-command reproduction script" requirement. Two things worth flagging now, both squarely in **your** lane as the person testing this on a clean machine:
+### 2. Create a Python Environment
 
-1. **The benchmark data is a manual Google Drive download, not a git-tracked file or a `wget`-able URL.** A true "one command" script either needs to script that download (`gdown`, if the file permissions allow it) or the README needs to say clearly "download this first, by hand" — otherwise the org's re-run stalls on step 1 and that's 60% of the score at risk.
-2. **`nemo_toolkit[asr]` is a heavy dependency** (NVIDIA's ASR toolkit) and the original hackathon PRD mentioned a "single 48GB GPU" as the standard eval machine — worth confirming with P3 whether the ASR step needs that GPU or can run on CPU/smaller hardware, since "clean machine" for your test needs to match whatever the organizers actually run on.
+```bash
+python -m venv .venv
+```
 
-## The 12 mock tools (confirmed from FDB-v3)
+Activate it:
 
-| Domain | Tools |
-|---|---|
-| Travel & Identity | `search_flights`, `book_flight`, `update_identity_doc` |
-| Finance & Billing | `get_card_benefits`, `get_exchange_rate`, `modify_autopay` |
+**Windows**
+
+```bash
+.venv\Scripts\activate
+```
+
+**macOS / Linux**
+
+```bash
+source .venv/bin/activate
+```
+
+### 3. Install Dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+### 4. Configure Environment Variables
+
+Create a local `.env` / `.env.local` file with the API credentials required by the selected agent/tool integrations.
+
+> **Do not commit API keys or other secrets to the repository.**
+
+### 5. Run the Application
+
+Use the project's existing entry point and frontend setup for the demo environment. The benchmark environment and model-specific integrations may require additional dependencies described in the relevant project modules.
+
+---
+
+##  Testing
+
+The repository includes focused tests for two important correctness properties:
+
+```bash
+python test_cancellation.py
+python test_ledger.py
+```
+
+These tests target cancellation behavior and ledger/idempotency handling.
+
+---
+
+##  Benchmark
+
+The project is designed around **Full-Duplex-Bench v3 (FDB-v3)**, which evaluates real-time agent behavior across interruption handling, tool calls and multi-step scenarios.
+
+The benchmark setup includes scenarios spanning:
+
+* Travel & Identity
+* Finance & Billing
+* Housing & Location
+* E-Commerce
+
+The project specifically focuses on the failure modes caused by **self-correction, asynchronous tool execution and multi-step tool chains**.
+
+> Benchmark scores should be added here once the final end-to-end evaluation run is available. No unverified performance numbers are reported in this README.
+
+---
+
+## 🔧 Mock Tool Domains
+
+| Domain             | Example Tools                                                    |
+| ------------------ | ---------------------------------------------------------------- |
+| Travel & Identity  | `search_flights`, `book_flight`, `update_identity_doc`           |
+| Finance & Billing  | `get_card_benefits`, `get_exchange_rate`, `modify_autopay`       |
 | Housing & Location | `search_apartments`, `calculate_commute`, `update_search_filter` |
-| E-Commerce | `track_order`, `search_products`, `add_to_cart` |
+| E-Commerce         | `track_order`, `search_products`, `add_to_cart`                  |
 
-## Extension use case
+---
 
-`TODO` — one new use case beyond the benchmark's 4 domains, working end-to-end, shown in the demo video (not a slide sketch). Candidates from the PRD: in-car destination change, device troubleshooting with a camera frame, hands-free kitchen assistant. P3 picks and builds one fully rather than splitting effort.
+##  Why This Approach?
 
-## Benchmark results
+The key design principle is simple:
 
-`TODO` — our best run's scores, seeds, and config, once P3 has FDB-v3 running end-to-end against the complete agent (Day 2 AM per the timeline).
+> **A tool result is not automatically correct just because it arrived successfully. It must still belong to the current user intent.**
 
-## Status
+This makes the orchestration layer suitable for real-time agents where user input and asynchronous tool execution happen concurrently.
 
-| Module | Owner | Status |
-|---|---|---|
-| P1 — LiveKit agent core + orchestration logic | — | Not started |
-| P2 — Reasoning & tool-calling | — | Not started |
-| P3 — Benchmark integration & extension | — | Not started |
-| P4 — README, video, slides, test runs | Manas | This README skeleton |
+---
 
-## Hard constraints (disqualification risks)
+##  Team
 
-- Never hardcode/memorize/fine-tune on FDB-v3 test items — it's public, they check
-- No calling our own servers at evaluation time — all agent logic must live in the submission
-- No caching across scenarios — each conversation starts fresh
-- Pin seeds and versions so the organizers' re-run matches our logs
+| Role                     | Responsibility                            |
+| ------------------------ | ----------------------------------------- |
+| **P1**                   | LiveKit agent core + orchestration logic  |
+| **P2**                   | Reasoning + tool calling                  |
+| **P3**                   | Benchmark integration + extension         |
+| **P4 — Manashvi Sharma** | README, demo video, slides + verification |
 
-## Team
+### P4 — Documentation & Demo
 
-**P1 — LiveKit Agent Core + Orchestration Logic:** LiveKit setup, interruption classifier wiring, state/revision system, idempotency ledger, tool-call cancellation.
+**Manashvi Sharma** — [GitHub](https://github.com/manas765)
 
-**P2 — Reasoning & Tool-Calling:** LLM intent detection, slot extraction, tool selection against FDB-v3's 12 mock tools, structured state-snapshot output.
+Responsible for project documentation, architecture presentation, demo recording, submission material and independent verification of the workflow.
 
-**P3 — Benchmark Integration & Extension:** FDB-v3 setup, baseline run, one-command reproduction script, run logs, the extension use case.
+---
 
-**P4 — README, Video, Slides, Test Runs (Manas):** This document, architecture diagram, demo video, slide deck, and independent verification of the reproduction script on a clean machine.
+##  Project Status
+
+**Demo-ready orchestration workflow**
+
+The current demonstration covers interruption-aware state updates, revision tracking, stale-result protection and tool-ledger observability. Final benchmark metrics should be populated from the team's reproducible end-to-end evaluation run.
+
+---
+
+##  License
+
+See the repository for the applicable project license and submission terms.
